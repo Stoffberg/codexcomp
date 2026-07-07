@@ -69,6 +69,25 @@ def message_round(rid: str, reasoning_toks: int, text: str):
     ]
 
 
+def compaction_round(rid: str):
+    """Canned upstream events for a Codex compaction task: one `compaction`
+    output item, zero reasoning tokens."""
+    item = {"id": rid, "type": "compaction"}
+    return [
+        {"type": "response.created", "sequence_number": 0,
+         "response": {"id": "resp_1", "created_at": 111, "status": "in_progress"}},
+        {"type": "response.in_progress", "sequence_number": 1, "response": {"id": "resp_1"}},
+        {"type": "response.output_item.added", "output_index": 0, "item": item},
+        {"type": "response.output_item.done", "output_index": 0, "item": item},
+        {"type": "response.completed", "response": {
+            "id": "resp_1", "status": "completed",
+            "usage": {"input_tokens": 200000, "output_tokens": 3500,
+                      "total_tokens": 203500,
+                      "output_tokens_details": {"reasoning_tokens": 0}},
+        }},
+    ]
+
+
 async def collect_fold(base_body, rounds):
     """Run fold() against canned rounds and return opened bodies plus events."""
     opened_bodies = []
@@ -302,6 +321,31 @@ async def test_repeated_zero_reasoning_respects_continue_cap():
         True, True, True, True]
 
 
+async def test_compaction_turn_is_never_continued():
+    """A compaction task must pass through in one round. Upstream requires the
+    compaction_trigger input item to stay final, so any continuation round is
+    rejected with 400 — and compaction summaries legitimately report zero
+    reasoning tokens, which would otherwise trip the zero-reasoning retry on
+    high-effort gpt-5.5 and fail the whole compaction."""
+    base = {
+        "model": "gpt-5.5",
+        "reasoning": {"effort": "xhigh"},
+        "input": [{"type": "message", "role": "user"},
+                  {"type": "compaction_trigger"}],
+        "stream": True,
+    }
+    opened_bodies, out = await collect_fold(base, [compaction_round("comp_1")])
+
+    assert len(opened_bodies) == 1, len(opened_bodies)
+    dict_events = [e for e in out if isinstance(e, dict)]
+    flushed = [e["item"]["type"] for e in dict_events
+               if e["type"] == "response.output_item.done"]
+    assert flushed == ["compaction"], flushed
+    term = dict_events[-1]["response"]
+    assert term["status"] == "completed"
+    assert term["metadata"]["proxy_stopped_reason"] == "compaction_passthrough"
+
+
 async def main():
     await test_happy_fold()
     await test_round1_rejected()
@@ -310,6 +354,7 @@ async def main():
     await test_zero_reasoning_retry_for_high_effort_gpt55()
     await test_zero_reasoning_retry_is_narrowly_gated()
     await test_repeated_zero_reasoning_respects_continue_cap()
+    await test_compaction_turn_is_never_continued()
     print("fold self-test: ALL PASS")
 
 

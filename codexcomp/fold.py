@@ -361,9 +361,17 @@ async def fold(
             "zero_reasoning_retry": zero_retry,
         })
         has_enc = bool(round_reasoning and round_reasoning[-1].get("encrypted_content"))
+        # Compaction turns can never be continued: upstream requires the
+        # compaction_trigger input item to stay final, so a replayed round
+        # (reasoning tail + nudge appended after it) is always rejected 400.
+        is_compaction = any(
+            isinstance(it, dict) and it.get("type") == "compaction_trigger"
+            for it in orig_input
+        ) or any(e["item"].get("type") == "compaction" for e in buffered)
 
         do_continue = (
             terminal is not None
+            and not is_compaction
             and (
                 (in_continue_window(n) and has_enc)
                 or zero_retry
@@ -371,7 +379,9 @@ async def fold(
             and round_no <= MAX_CONTINUE
         )
         stopped_reason = None
-        if terminal is not None and not do_continue and zero_retry:
+        if terminal is not None and is_compaction:
+            stopped_reason = "compaction_passthrough"
+        elif terminal is not None and not do_continue and zero_retry:
             stopped_reason = "zero_reasoning_max_continue"
         elif not do_continue and n is not None:
             stopped_reason = (

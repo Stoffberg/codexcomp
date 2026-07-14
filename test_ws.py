@@ -11,6 +11,7 @@ import json
 
 import httpx
 from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from codexcomp.server import build_app
 
@@ -42,6 +43,8 @@ def mock_upstream(request: httpx.Request) -> httpx.Response:
     upstream_calls.append(body)
     if body.get("model") == "fail-me":
         return httpx.Response(400, json={"detail": "boom"})
+    if body.get("model") == "hang-me":
+        raise httpx.ReadTimeout("simulated upstream stall")
     rid = f"resp_up_{len(upstream_calls)}"
     return httpx.Response(200, content=canned_sse(rid),
                           headers={"content-type": "text/event-stream"})
@@ -138,6 +141,35 @@ def test_failed_turn_invalidates_state():
         assert frame["response"]["error"]["code"] == "unknown_previous_response_id"
 
 
+def test_upstream_timeout_fails_loud():
+    """An upstream transport error (e.g. httpx.ReadTimeout on a stalled
+    request) must surface as response.failed and a clean 1011 close — never
+    escape and kill the socket uncleanly, which leaves Codex frozen mid-turn."""
+    client = make_client()
+    with client.websocket_connect("/v1/responses") as ws:
+        ws.send_text(json.dumps({"type": "response.create", "model": "hang-me",
+                                 "stream": True, "input": [USER1]}))
+        frame = json.loads(ws.receive_text())
+        assert frame["type"] == "response.failed", frame
+        assert frame["response"]["error"]["code"] == "upstream_error", frame
+        try:
+            ws.receive_text()
+            raise AssertionError("socket must close after upstream failure")
+        except WebSocketDisconnect as exc:
+            assert exc.code == 1011, exc.code
+
+
+def test_post_sse_upstream_timeout():
+    """The HTTP fallback path converts the same failure into a terminal
+    response.failed event instead of aborting the stream."""
+    client = make_client()
+    resp = client.post("/v1/responses",
+                       json={"model": "hang-me", "stream": True, "input": [USER1]})
+    assert resp.status_code == 200
+    assert '"code": "upstream_error"' in resp.text, resp.text
+    assert "data: [DONE]" in resp.text
+
+
 def test_post_sse_unchanged():
     """The HTTP fallback path still passes full-input bodies straight through."""
     client = make_client()
@@ -155,6 +187,10 @@ def main():
     test_unknown_previous_response()
     upstream_calls.clear()
     test_failed_turn_invalidates_state()
+    upstream_calls.clear()
+    test_upstream_timeout_fails_loud()
+    upstream_calls.clear()
+    test_post_sse_upstream_timeout()
     upstream_calls.clear()
     test_post_sse_unchanged()
     print("ws transport self-test: ALL PASS")

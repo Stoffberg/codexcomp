@@ -123,7 +123,7 @@ class UpstreamRounds:
             content=json.dumps(body, ensure_ascii=False).encode(),
             headers={**self.headers, "content-type": "application/json",
                      "accept": "text/event-stream"},
-            timeout=httpx.Timeout(connect=30, read=600, write=60, pool=30),
+            timeout=httpx.Timeout(connect=30, read=120, write=60, pool=30),
         )
         resp = await self.client.send(req, stream=True)
         if resp.status_code >= 400:
@@ -234,6 +234,17 @@ def unknown_previous_response_frame(exc: UnknownPreviousResponse) -> dict[str, A
     }
 
 
+def upstream_failure_frame(exc: Exception) -> dict[str, Any]:
+    return {
+        "type": "response.failed",
+        "sequence_number": 0,
+        "response": {"status": "failed",
+                     "error": {"message": f"codexcomp: upstream request failed ({exc!r}); "
+                                          "reconnect and resend full input",
+                               "code": "upstream_error"}},
+    }
+
+
 # --- downstream endpoints -----------------------------------------------------
 
 
@@ -267,8 +278,13 @@ async def responses_post(request: Request) -> Response:
     events = drive_fold(request.app.state, upstream_headers(request.headers.raw), body)
 
     async def stream() -> AsyncIterator[bytes]:
-        async for ev in events:
-            yield sse_bytes(ev)
+        try:
+            async for ev in events:
+                yield sse_bytes(ev)
+        except (httpx.HTTPError, RoundOpenError) as exc:
+            log.warning("sse: upstream failure %r — emitting response.failed", exc)
+            yield sse_bytes(upstream_failure_frame(exc))
+            yield sse_bytes(DONE)
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -301,11 +317,21 @@ async def responses_ws(ws: WebSocket) -> None:
                 await ws.send_text(json.dumps(sess.prewarm_ack(body), ensure_ascii=False))
                 continue
             sess.note_request(body)
-            async for ev in drive_fold(ws.app.state, headers, body):
-                if ev is DONE:
-                    continue
-                sess.note_event(ev)
-                await ws.send_text(json.dumps(ev, ensure_ascii=False))
+            try:
+                async for ev in drive_fold(ws.app.state, headers, body):
+                    if ev is DONE:
+                        continue
+                    sess.note_event(ev)
+                    await ws.send_text(json.dumps(ev, ensure_ascii=False))
+            except (httpx.HTTPError, RoundOpenError) as exc:
+                # Fail loud and drop the connection: Codex sees the failure,
+                # reconnects, and resends full input — never let the exception
+                # kill the socket uncleanly and leave the client hanging.
+                log.warning("ws: upstream failure %r — closing so the client retries", exc)
+                await ws.send_text(json.dumps(upstream_failure_frame(exc),
+                                              ensure_ascii=False))
+                await ws.close(code=1011)
+                return
     except WebSocketDisconnect:
         pass
 

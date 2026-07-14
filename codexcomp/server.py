@@ -19,6 +19,7 @@ transport-agnostic.
 """
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 import logging
@@ -105,6 +106,12 @@ def parse_sse(text_chunks: AsyncIterator[str]) -> AsyncIterator[dict | object]:
     return gen()
 
 
+# A stalled upstream never starts responding at all, so give up on the
+# response *starting* quickly; once the stream is live, reads may legitimately
+# pause much longer (silent reasoning), so they keep the laxer read timeout.
+RESPONSE_START_TIMEOUT = 30
+
+
 class UpstreamRounds:
     """RoundOpener bound to one downstream request's headers; closes the
     previous round's response before opening the next."""
@@ -125,7 +132,13 @@ class UpstreamRounds:
                      "accept": "text/event-stream"},
             timeout=httpx.Timeout(connect=30, read=120, write=60, pool=30),
         )
-        resp = await self.client.send(req, stream=True)
+        try:
+            async with asyncio.timeout(RESPONSE_START_TIMEOUT):
+                resp = await self.client.send(req, stream=True)
+        except TimeoutError as exc:
+            raise httpx.ReadTimeout(
+                f"upstream sent no response within {RESPONSE_START_TIMEOUT}s"
+            ) from exc
         if resp.status_code >= 400:
             detail = (await resp.aread()).decode(errors="replace")
             await resp.aclose()

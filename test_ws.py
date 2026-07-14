@@ -7,12 +7,15 @@ ever sees stateless full-input bodies.
 
 Run: uv run python test_ws.py
 """
+import asyncio
 import json
+import time
 
 import httpx
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+import codexcomp.server
 from codexcomp.server import build_app
 
 USER1 = {"type": "message", "role": "user",
@@ -159,6 +162,39 @@ def test_upstream_timeout_fails_loud():
             assert exc.code == 1011, exc.code
 
 
+class NeverRespondsTransport(httpx.AsyncBaseTransport):
+    """Upstream that accepts the request but never starts responding —
+    the observed chatgpt.com stall mode."""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(60)
+        raise AssertionError("unreachable")
+
+
+def test_response_start_timeout():
+    """A round whose response never starts is cut off after
+    RESPONSE_START_TIMEOUT and fails loud, instead of hanging for the full
+    read timeout."""
+    saved = codexcomp.server.RESPONSE_START_TIMEOUT
+    codexcomp.server.RESPONSE_START_TIMEOUT = 0.2
+    try:
+        app = build_app("http://upstream.test/v1")
+        app.state.client = httpx.AsyncClient(transport=NeverRespondsTransport())
+        client = TestClient(app)
+        with client.websocket_connect("/v1/responses") as ws:
+            t0 = time.monotonic()
+            ws.send_text(json.dumps({"type": "response.create", "model": "gpt-5.5",
+                                     "stream": True, "input": [USER1]}))
+            frame = json.loads(ws.receive_text())
+            elapsed = time.monotonic() - t0
+            assert frame["type"] == "response.failed", frame
+            assert frame["response"]["error"]["code"] == "upstream_error", frame
+            assert "no response within" in frame["response"]["error"]["message"]
+            assert elapsed < 5, f"cutoff took {elapsed:.1f}s, timeout not applied"
+    finally:
+        codexcomp.server.RESPONSE_START_TIMEOUT = saved
+
+
 def test_post_sse_upstream_timeout():
     """The HTTP fallback path converts the same failure into a terminal
     response.failed event instead of aborting the stream."""
@@ -189,6 +225,8 @@ def main():
     test_failed_turn_invalidates_state()
     upstream_calls.clear()
     test_upstream_timeout_fails_loud()
+    upstream_calls.clear()
+    test_response_start_timeout()
     upstream_calls.clear()
     test_post_sse_upstream_timeout()
     upstream_calls.clear()

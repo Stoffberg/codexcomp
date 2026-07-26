@@ -181,6 +181,7 @@ class WsSession:
         self.last_id: str | None = None
         self.last_input: list[Any] = []
         self.last_output: list[Any] = []
+        self.cache_settings: dict[str, Any] = {}
         self._prewarms = 0
 
     def expand(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -194,6 +195,8 @@ class WsSession:
                 raise UnknownPreviousResponse(prev_id)
             delta = list(body.get("input") or [])
             body["input"] = [*self.last_input, *self.last_output, *delta]
+            for key, value in self.cache_settings.items():
+                body.setdefault(key, value)
             log.info("ws: rebuilt incremental frame: %d delta -> %d full input items",
                      len(delta), len(body["input"]))
         return body
@@ -206,8 +209,18 @@ class WsSession:
         self.last_id = f"resp_codexcomp_prewarm_{self._prewarms}"
         self.last_input = list(body.get("input") or [])
         self.last_output = []
-        log.info("ws: prewarm acked locally as %s (%d input items)",
-                 self.last_id, len(self.last_input))
+        self.cache_settings = {
+            key: body[key]
+            for key in ("prompt_cache_key", "prompt_cache_options")
+            if key in body
+        }
+        log.info(
+            "ws: prewarm acked locally as %s (%d input items, %d tools, cache key %s)",
+            self.last_id,
+            len(self.last_input),
+            len(body.get("tools") or []),
+            "set" if body.get("prompt_cache_key") else "unset",
+        )
         return {
             "type": "response.completed",
             "sequence_number": 0,
@@ -228,6 +241,9 @@ class WsSession:
         self.last_id = None
         self.last_input = list(body.get("input") or [])
         self.last_output = []
+        for key in ("prompt_cache_key", "prompt_cache_options"):
+            if key in body:
+                self.cache_settings[key] = body[key]
 
     def note_event(self, ev: dict[str, Any]) -> None:
         if ev.get("type") != "response.completed":
@@ -265,6 +281,14 @@ async def drive_fold(state: Any, headers: dict[str, str],
                      body: dict[str, Any]) -> AsyncIterator[dict | object]:
     """One folded request: owns the UpstreamRounds lifecycle and yields
     downstream events. Transports only serialize what comes out of here."""
+    log.info(
+        "request: model=%s input_items=%d tools=%d cache_key=%s cache_options=%s",
+        body.get("model"),
+        len(body.get("input") or []),
+        len(body.get("tools") or []),
+        "set" if body.get("prompt_cache_key") else "unset",
+        body.get("prompt_cache_options") or "implicit",
+    )
     rounds = UpstreamRounds(state.client, state.upstream_base + "/responses", headers)
     try:
         async for ev in fold(body, rounds.open):

@@ -21,6 +21,8 @@ from codexcomp.server import build_app
 USER1 = {"type": "message", "role": "user",
          "content": [{"type": "input_text", "text": "hi"}]}
 FCO = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+CACHE_KEY = "codex-test-prefix"
+CACHE_OPTIONS = {"mode": "implicit"}
 
 upstream_calls: list[dict] = []
 
@@ -76,6 +78,8 @@ def test_prewarm_then_incremental():
         # 1. prewarm: generate=false, full input — must NOT reach upstream
         ws.send_text(json.dumps({"type": "response.create", "model": "gpt-5.5",
                                  "stream": True, "input": [USER1],
+                                 "prompt_cache_key": CACHE_KEY,
+                                 "prompt_cache_options": CACHE_OPTIONS,
                                  "generate": False}))
         ack = json.loads(ws.receive_text())
         assert ack["type"] == "response.completed", ack
@@ -93,6 +97,8 @@ def test_prewarm_then_incremental():
         assert term["type"] == "response.completed"
         up1 = upstream_calls[0]
         assert up1["input"] == [USER1], up1["input"]
+        assert up1["prompt_cache_key"] == CACHE_KEY
+        assert up1["prompt_cache_options"] == CACHE_OPTIONS
         assert "previous_response_id" not in up1 and "generate" not in up1
         seqs = [f["sequence_number"] for f in frames]
         assert seqs == list(range(len(seqs))), seqs
@@ -107,6 +113,8 @@ def test_prewarm_then_incremental():
         up2 = upstream_calls[1]
         assert up2["input"] == [USER1, answer_item, FCO], \
             [i.get("type") for i in up2["input"]]
+        assert up2["prompt_cache_key"] == CACHE_KEY
+        assert up2["prompt_cache_options"] == CACHE_OPTIONS
         assert "previous_response_id" not in up2
 
 

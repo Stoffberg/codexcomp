@@ -53,6 +53,16 @@ def _port_in_use(host: str, port: int) -> bool:
         return s.connect_ex((host, port)) == 0
 
 
+def _configure_logging(log_level: str) -> str:
+    logging.basicConfig(level=log_level.upper(),
+                        format="%(levelname)s:%(name)s:%(message)s")
+    if log_level == "debug":
+        for name in ("httpcore", "httpx", "websockets"):
+            logging.getLogger(name).setLevel(logging.INFO)
+        return "info"
+    return log_level
+
+
 def _serve(args) -> int:
     import uvicorn
 
@@ -63,10 +73,9 @@ def _serve(args) -> int:
               f"port with --port N (and set Codex's openai_base_url to match).",
               flush=True)
         return 1
-    logging.basicConfig(level=args.log_level.upper(),
-                        format="%(levelname)s:%(name)s:%(message)s")
+    uvicorn_log_level = _configure_logging(args.log_level)
     uvicorn.run(build_app(args.upstream), host=args.host, port=args.port,
-                log_level=args.log_level)
+                log_level=uvicorn_log_level)
     return 0
 
 
